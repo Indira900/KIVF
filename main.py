@@ -14,6 +14,7 @@ from functools import wraps
 from werkzeug.utils import secure_filename
 import joblib
 from database import db
+from schema_migration import upgrade_database_schema
 import pytesseract
 from pdfminer.high_level import extract_text as pdf_extract_text
 from PIL import Image
@@ -100,6 +101,9 @@ class ForumPost(db.Model):
 with app.app_context():
     # This command creates the database file and all tables from models.py
     db.create_all()
+    added_columns = upgrade_database_schema(db.engine, db.metadata)
+    if added_columns:
+        logging.info("Added missing medical_document columns: %s", ", ".join(added_columns))
     logging.info("Database tables created successfully")
 
     # --- Data Seeding for Demonstration ---
