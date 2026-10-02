@@ -6,7 +6,7 @@ import hashlib
 import secrets
 import numpy as np
 import webbrowser
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from collections import defaultdict
 from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -49,10 +49,19 @@ os.makedirs("models", exist_ok=True)
 # --- Import Models ---
 from models import (
     User, PatientData, IVFCycle, WellnessLog, MedicationReminder, ChatMessage,
-    MedicalDocument, Prediction, CycleNote, Clinic, MedicalActivity, Message,
+    MedicalDocument, MedicalFeatureHistory, Prediction, CycleNote, Clinic, MedicalActivity, Message,
     AuditLog, Notification, DocumentVersion, DocumentAnnotation, DocumentShare,
     SimulationResult, PartnerConnection, PartnerInvitation, PartnerSharingPermission,
     SharedTask, SharedNote, PartnerCheckIn, PartnerNotification, PartnerMessage
+)
+from medical_document_workflow import (
+    OCR_TO_PATIENT_FIELD,
+    OCR_TO_DASHBOARD_FIELD,
+    PREDICTION_FIELD_MAP,
+    extract_report_date,
+    sha256_bytes,
+    validate_ocr_ai_features,
+    validate_prediction_payload,
 )
 
 # --- Import AI and Prediction Services ---
@@ -1271,24 +1280,40 @@ def ivf_predictor():
         flash('Please complete your medical profile first.', 'error')
         return redirect(url_for('update_profile'))
 
-    # Calculate predictions using the service
-    success_prediction = calculate_ivf_success_prediction(patient_data)
-    embryo_quality_score = calculate_embryo_quality_score(patient_data)
-    protocol_recommendations = generate_personalized_protocol(patient_data)
-
-    # Save the new prediction to the database
-    new_prediction = Prediction(
-        user_id=user.id,
-        success_probability=success_prediction.get('success_rate', 0) / 100.0, # Convert to 0-1.0 scale
-        protocol_recommendation=protocol_recommendations.get('protocol_name'),
-        llm_analysis=json.dumps({
-            "success_factors": success_prediction.get('factors'),
-            "embryo_score": embryo_quality_score.get('quality_score'),
-            "protocol_optimizations": protocol_recommendations.get('success_optimization')
-        })
-    )
-    db.session.add(new_prediction)
-    db.session.commit()
+    dashboard_values, feature_sources, missing_fields, latest_report = _dashboard_feature_state(user, patient_data)
+    success_prediction = embryo_quality_score = protocol_recommendations = None
+    if not missing_fields:
+        try:
+            validated_values = validate_prediction_payload(dashboard_values)
+            from types import SimpleNamespace
+            predictor_input = SimpleNamespace(
+                age=validated_values['Age'], bmi=validated_values['BMI'],
+                amh=validated_values['AMH'], amh_level=validated_values['AMH'],
+                fsh=validated_values['FSH'], fsh_level=validated_values['FSH'],
+                previous_ivf=validated_values['Previous_IVF_Attempts'],
+                previous_ivf_cycles=validated_values['Previous_IVF_Attempts'],
+                stress=validated_values['Stress_Level'], sleep_hours=validated_values['Sleep_Hours'],
+                exercise_min=validated_values['Exercise_Min_per_Day'],
+                partner_age=patient_data.partner_age, lifestyle_factors=patient_data.lifestyle_factors,
+            )
+            success_prediction = calculate_ivf_success_prediction(predictor_input)
+            embryo_quality_score = calculate_embryo_quality_score(patient_data)
+            protocol_recommendations = generate_personalized_protocol(patient_data)
+            db.session.add(Prediction(
+                user_id=user.id,
+                success_probability=success_prediction.get('success_rate', 0) / 100.0,
+                protocol_recommendation=protocol_recommendations.get('protocol_name'),
+                llm_analysis=json.dumps({
+                    "success_factors": success_prediction.get('factors'),
+                    "embryo_score": embryo_quality_score.get('quality_score'),
+                    "protocol_optimizations": protocol_recommendations.get('success_optimization')
+                }),
+                model_metadata=json.dumps({"source": "ivf_predictor_page", "feature_order": list(PREDICTION_FIELD_MAP.values())}),
+            ))
+            db.session.commit()
+        except ValueError as exc:
+            db.session.rollback()
+            app.logger.info("AI predictor withheld for user_id=%s: %s", user.id, exc)
 
     # Security: Disclaimer for AI usage
     disclaimer_text = "DISCLAIMER: This system uses Artificial Intelligence to provide estimates based on statistical data. It is NOT a diagnostic tool and should not replace professional medical advice. Always consult your fertility specialist."
@@ -1299,6 +1324,10 @@ def ivf_predictor():
                           success_prediction=success_prediction,
                           embryo_quality_score=embryo_quality_score,
                           protocol_recommendations=protocol_recommendations,
+                          dashboard_values=dashboard_values,
+                          feature_sources=feature_sources,
+                          missing_prediction_fields=missing_fields,
+                          latest_report=latest_report,
                           disclaimer_text=disclaimer_text)
 
 # Wellness tracking
@@ -1512,162 +1541,308 @@ def update_profile():
     
     return render_template('update_profile.html', user=user, patient_data=patient_data)
 
-# File upload with AI extraction and prediction
+def _read_medical_document_text(file_path, content_type, filename):
+    """Run the project's existing PDF/OCR/Word/text extraction implementation."""
+    content_type = content_type or ''
+    if content_type == 'application/pdf':
+        return pdf_extract_text(file_path) or ''
+    if content_type.startswith('image/'):
+        with Image.open(file_path) as image:
+            return pytesseract.image_to_string(image) or ''
+    if 'word' in content_type or filename.lower().endswith(('.doc', '.docx')):
+        from docx import Document as WordDocument
+        doc = WordDocument(file_path)
+        return '\n'.join(paragraph.text for paragraph in doc.paragraphs)
+    try:
+        with open(file_path, 'r', encoding='utf-8') as stream:
+            return stream.read()
+    except UnicodeDecodeError:
+        return ''
+
+
+def _stored_document_path(document):
+    filename = os.path.basename(document.filename or '')
+    return os.path.join(app.config['UPLOAD_FOLDER'], filename) if filename else None
+
+
+def _backfill_document_identity(user_id):
+    """Hash pre-migration documents when their original upload files still exist."""
+    changed = False
+    for document in MedicalDocument.query.filter_by(user_id=user_id).all():
+        path = _stored_document_path(document)
+        if not document.report_date and document.extracted_text:
+            document.report_date = extract_report_date(document.extracted_text)
+            changed = True
+        if not document.file_hash and path and os.path.isfile(path):
+            try:
+                with open(path, 'rb') as stream:
+                    document.file_hash = sha256_bytes(stream.read())
+                changed = True
+            except OSError:
+                app.logger.warning("Could not backfill document identity for document_id=%s", document.id)
+    if changed:
+        db.session.commit()
+
+
+def _dashboard_feature_state(user, patient_data):
+    """Build the eight established model inputs and safe, per-field provenance."""
+    wellness = WellnessLog.query.filter_by(user_id=user.id).order_by(WellnessLog.date.desc()).first()
+    raw_values = {
+        'Age': patient_data.age,
+        'BMI': patient_data.bmi,
+        'AMH': patient_data.amh_level,
+        'FSH': patient_data.fsh_level,
+        'Previous_IVF_Attempts': patient_data.previous_ivf_cycles,
+        'Stress_Level': wellness.stress_level if wellness else None,
+        'Sleep_Hours': wellness.sleep_hours if wellness else None,
+        'Exercise_Min_per_Day': wellness.exercise_minutes if wellness else None,
+    }
+    sources = {key: {'source': 'Patient profile' if key not in ('Stress_Level', 'Sleep_Hours', 'Exercise_Min_per_Day') else ('Wellness log' if wellness else 'Missing'),
+                     'status': 'Available' if value is not None else 'Missing'}
+              for key, value in raw_values.items()}
+    history_to_form = {
+        'age': 'Age', 'bmi': 'BMI', 'amh': 'AMH', 'fsh': 'FSH',
+        'previous_ivf': 'Previous_IVF_Attempts', 'stress': 'Stress_Level',
+        'sleep_hours': 'Sleep_Hours', 'exercise_min': 'Exercise_Min_per_Day',
+    }
+    valid_history = (MedicalFeatureHistory.query.filter_by(user_id=user.id, validation_status='VALID')
+                     .order_by(MedicalFeatureHistory.extracted_at.desc(), MedicalFeatureHistory.id.desc()).all())
+    seen = set()
+    for history in valid_history:
+        form_key = history_to_form.get(history.feature_name)
+        if not form_key or form_key in seen:
+            continue
+        current_value = raw_values.get(form_key)
+        if current_value is None or history.new_value is None or not np.isclose(float(current_value), history.new_value):
+            continue
+        seen.add(form_key)
+        doc = history.document
+        is_ocr = history.extraction_source in ('OCR', 'USER_CONFIRMED_OCR')
+        sources[form_key] = {
+            'source': ('User Edited' if history.user_modified else 'Extracted from Medical Report') if is_ocr else 'User Edited',
+            'document': doc.original_filename if doc else None,
+            'report_date': history.report_date.isoformat() if history.report_date else None,
+            'extraction': 'User edit' if history.user_modified else ('OCR' if is_ocr else history.extraction_source),
+            'status': history.validation_status,
+            'confidence': history.confidence,
+            'user_edited': history.user_modified,
+        }
+    values = {key: (None if value is None else float(value)) for key, value in raw_values.items()}
+    if values['Age'] is not None:
+        values['Age'] = int(values['Age'])
+    if values['Previous_IVF_Attempts'] is not None:
+        values['Previous_IVF_Attempts'] = int(values['Previous_IVF_Attempts'])
+    if values['Stress_Level'] is not None:
+        values['Stress_Level'] = int(values['Stress_Level'])
+    if values['Exercise_Min_per_Day'] is not None:
+        values['Exercise_Min_per_Day'] = int(values['Exercise_Min_per_Day'])
+    missing = [key for key, value in values.items() if value is None]
+    latest_report = (MedicalDocument.query.filter_by(user_id=user.id, is_latest=True)
+                     .order_by(MedicalDocument.report_date.desc(), MedicalDocument.uploaded_at.desc()).first())
+    return values, sources, missing, latest_report
+
+
+def _upload_response(status, message, document=None, user=None, patient_data=None, http_status=200, extra=None):
+    payload = {'status': status, 'message': message, 'document_id': document.id if document else None}
+    if document:
+        payload.update({
+            'filename': document.original_filename,
+            'report_date': document.report_date.isoformat() if document.report_date else None,
+            'processing_status': document.processing_status,
+            'extracted_features': json.loads(document.extracted_features or '{}'),
+            'validation': json.loads(document.validation_summary or '{}'),
+        })
+    if user and patient_data:
+        values, sources, missing, latest = _dashboard_feature_state(user, patient_data)
+        payload.update({'dashboard_values': values, 'feature_sources': sources,
+                        'missing_prediction_fields': missing,
+                        'prediction_ready': not missing and document is not None and document.processing_status == 'VALIDATED',
+                        'latest_report': latest.original_filename if latest else None,
+                        'latest_report_id': latest.id if latest else None})
+    if extra:
+        payload.update(extra)
+    if request.headers.get('X-Requested-With') == 'XMLHttpRequest' or request.accept_mimetypes.best == 'application/json':
+        return jsonify(payload), http_status
+    flash(message, 'success' if status in ('VALIDATED', 'DUPLICATE', 'OLD_REPORT') else 'warning' if status == 'VALIDATION_REQUIRED' else 'error')
+    return redirect(request.referrer or url_for('my_documents'))
+
+
+def _find_latest_report_for_freshness(user_id):
+    # A legacy document with a report date but no modern validation state is a
+    # freshness guard only; it is not presented as a validated dashboard source.
+    eligible_statuses = ('VALIDATED', 'OCR_COMPLETED', 'UPLOADED')
+    return (MedicalDocument.query.filter_by(user_id=user_id)
+            .filter(MedicalDocument.report_date.isnot(None))
+            .filter((MedicalDocument.is_latest.is_(True)) | (MedicalDocument.processing_status.is_(None)) |
+                    (MedicalDocument.processing_status.in_(eligible_statuses)))
+            .order_by(MedicalDocument.report_date.desc(), MedicalDocument.uploaded_at.desc()).first())
+
+
+# Existing upload route, now with idempotent OCR, per-field validation and provenance.
 @app.route('/upload_document', methods=['POST'])
 @login_required
 def upload_document():
-    extracted_medical_data = None
-    ai_prediction = None
-    auto_saved = False
-    
-    if 'file' not in request.files:
-        flash('No file selected.', 'error')
-        return redirect(request.referrer)
+    user = User.query.get(session['user_id'])
+    if user is None:
+        return _upload_response('FAILED', 'Your session has expired. Please log in again.', http_status=401)
+    if 'file' not in request.files or not request.files['file'].filename:
+        return _upload_response('FAILED', 'No file selected.', http_status=400)
+    upload = request.files['file']
+    original_filename = secure_filename(upload.filename)
+    if not original_filename or not allowed_file(original_filename):
+        return _upload_response('REJECTED', 'Invalid file type.', http_status=400)
 
-    file = request.files['file']
-    if file.filename == '':
-        flash('No file selected.', 'error')
-        return redirect(request.referrer)
+    content = upload.read()
+    if not content:
+        return _upload_response('REJECTED', 'The selected file is empty.', http_status=400)
+    file_hash = sha256_bytes(content)
+    try:
+        _backfill_document_identity(user.id)
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Document hash backfill failed for user_id=%s", user.id)
+    duplicate = MedicalDocument.query.filter_by(user_id=user.id, file_hash=file_hash).first()
+    patient_data = PatientData.query.filter_by(user_id=user.id).first()
+    if duplicate:
+        app.logger.info("Duplicate document skipped: user_id=%s document_id=%s", user.id, duplicate.id)
+        return _upload_response('DUPLICATE', 'Duplicate report detected. OCR processing skipped. Existing extracted data reused.',
+                                duplicate, user, patient_data, extra={'ocr_skipped': True, 'reused_existing_data': True})
 
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_')
-        
-        # Get file extension
-        file_ext = os.path.splitext(filename)[1] if '.' in filename else ''
-        
-        # Truncate filename to avoid Windows MAX_PATH limit (260 chars)
-        base_name = os.path.splitext(filename)[0][:50]
-        filename = timestamp + base_name + file_ext
-
-        # Ensure the uploads folder exists
-        upload_dir = app.config['UPLOAD_FOLDER']
-        os.makedirs(upload_dir, exist_ok=True)
-
-        file_path = os.path.join(upload_dir, filename)
-        file.save(file_path)
-
-        # Extract text from the file
-        extracted_text = ""
-        try:
-            if file.content_type == 'application/pdf':
-                extracted_text = pdf_extract_text(file_path)
-            elif file.content_type.startswith('image/'):
-                image = Image.open(file_path)
-                extracted_text = pytesseract.image_to_string(image)
-            elif 'word' in file.content_type or filename.endswith('.docx'):
-                try:
-                    from docx import Document
-                    doc = Document(file_path)
-                    extracted_text = '\n'.join([paragraph.text for paragraph in doc.paragraphs])
-                except:
-                    pass
-            else:
-                # Try to read as text
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        extracted_text = f.read()
-                except:
-                    pass
-        except Exception as e:
-            app.logger.error(f"Error extracting text: {e}")
-        
-        # Extract medical parameters from text
-        if extracted_text:
-            extracted_medical_data = extract_medical_params(extracted_text)
-            
-            # Generate automatic insights
-            medical_insights = generate_medical_insights(extracted_medical_data)
-            
-            # Try to auto-fill user profile
-            user = User.query.get(session['user_id'])
-            patient_data = PatientData.query.filter_by(user_id=user.id).first()
-            
-            if patient_data and extracted_medical_data:
-                # Auto-fill extracted values into patient profile
-                if extracted_medical_data.get('age') and not patient_data.age:
-                    patient_data.age = extracted_medical_data['age']
-                    auto_saved = True
-                
-                if extracted_medical_data.get('amh') and not patient_data.amh_level:
-                    patient_data.amh_level = extracted_medical_data['amh']
-                    auto_saved = True
-                
-                if extracted_medical_data.get('fsh') and not patient_data.fsh_level:
-                    patient_data.fsh_level = extracted_medical_data['fsh']
-                    auto_saved = True
-                
-                if auto_saved:
-                    db.session.commit()
-            
-            # Run AI prediction if we have enough data
-            if patient_data and extracted_medical_data.get('amh') and ivf_model:
-                try:
-                    # Create a temporary patient data for prediction
-                    pred_age = extracted_medical_data.get('age') or (patient_data.age if patient_data.age else 30)
-                    pred_bmi = patient_data.bmi if patient_data.bmi else 22
-                    pred_amh = extracted_medical_data.get('amh', 2.0)
-                    pred_fsh = extracted_medical_data.get('fsh', 6.0)
-                    pred_prev_ivf = patient_data.previous_ivf_cycles if patient_data.previous_ivf_cycles else 0
-                    
-                    # Use wellness data if available
-                    recent_wellness = WellnessLog.query.filter_by(user_id=user.id).order_by(WellnessLog.date.desc()).first()
-                    pred_stress = recent_wellness.stress_level if recent_wellness and recent_wellness.stress_level else 3
-                    pred_sleep = recent_wellness.sleep_hours if recent_wellness and recent_wellness.sleep_hours else 7
-                    pred_exercise = recent_wellness.exercise_minutes if recent_wellness and recent_wellness.exercise_minutes else 30
-                    
-                    features = np.array([[pred_age, pred_bmi, pred_amh, pred_fsh, pred_prev_ivf, pred_stress, pred_sleep, pred_exercise/30.0]])
-                    prediction = ivf_model.predict(features)[0]
-                    probability = ivf_model.predict_proba(features)[0]
-                    success_chance = probability[1] * 100
-                    
-                    ai_prediction = {
-                        'success_probability': round(success_chance, 1),
-                        'prediction': 'Likely Success' if prediction == 1 else 'Low Chance'
-                    }
-                    
-                    # Save prediction to database
-                    new_prediction = Prediction(
-                        user_id=user.id,
-                        success_probability=success_chance / 100.0,
-                        protocol_recommendation='Auto-generated from document',
-                        llm_analysis=json.dumps({
-                            'source': 'document_upload',
-                            'extracted_params': extracted_medical_data
-                        })
-                    )
-                    db.session.add(new_prediction)
-                    db.session.commit()
-                except Exception as e:
-                    app.logger.error(f"Error in AI prediction: {e}")
-        
-        # Save document with extracted text
+    upload_dir = app.config['UPLOAD_FOLDER']
+    os.makedirs(upload_dir, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f_')
+    ext = os.path.splitext(original_filename)[1].lower()
+    stored_filename = timestamp + os.path.splitext(original_filename)[0][:50] + ext
+    file_path = os.path.join(upload_dir, stored_filename)
+    try:
+        with open(file_path, 'wb') as stream:
+            stream.write(content)
         document = MedicalDocument(
-            user_id=session['user_id'],
-            filename=filename,
-            original_filename=file.filename,
-            file_type=file.content_type,
-            file_size=os.path.getsize(file_path),
-            description=request.form.get('description'),
-            extracted_text=extracted_text[:5000] if extracted_text else None
+            user_id=user.id, filename=stored_filename, original_filename=original_filename,
+            file_type=upload.content_type or '', file_size=len(content),
+            description=request.form.get('description'), file_hash=file_hash,
+            processing_status='PROCESSING', is_latest=False,
         )
-
         db.session.add(document)
         db.session.commit()
-        
-        # Show success message with AI summary info
-        flash('Document uploaded successfully!', 'success')
-        
-        # Pass extracted data to the template via session for display
-        if extracted_medical_data:
-            session['last_extracted_medical'] = extracted_medical_data
-            session['last_medical_insights'] = medical_insights if extracted_text else []
-            session['last_ai_prediction'] = ai_prediction
-            session['last_auto_saved'] = auto_saved
-    else:
-        flash('Invalid file type.', 'error')
+    except Exception:
+        db.session.rollback()
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        app.logger.exception("Could not save uploaded document metadata for user_id=%s", user.id)
+        return _upload_response('FAILED', 'The document could not be saved. Existing patient data was not changed.', http_status=500)
 
-    return redirect(url_for('my_documents'))
+    app.logger.info("New document accepted: user_id=%s document_id=%s", user.id, document.id)
+    extracted_text = ''
+    try:
+        app.logger.info("Document text extraction started: document_id=%s", document.id)
+        extracted_text = _read_medical_document_text(file_path, upload.content_type, original_filename)
+    except Exception as exc:
+        document.processing_status = 'FAILED'
+        document.validation_summary = json.dumps({'error': type(exc).__name__})
+        document.processed_at = datetime.now(timezone.utc)
+        db.session.commit()
+        app.logger.exception("Document text extraction failed: document_id=%s", document.id)
+        return _upload_response('FAILED', 'Unable to extract information from this document. Existing patient data was not changed.', document, user, patient_data, 422)
+
+    document.extracted_text = extracted_text[:20000] if extracted_text else None
+    if not extracted_text.strip():
+        document.processing_status = 'FAILED'
+        document.validation_summary = json.dumps({'error': 'No readable text was extracted.'})
+        document.processed_at = datetime.now(timezone.utc)
+        db.session.commit()
+        app.logger.warning("No text extracted: document_id=%s", document.id)
+        return _upload_response('FAILED', 'Unable to extract information from this document. Existing patient data was not changed.', document, user, patient_data, 422)
+
+    ocr_report_date = extract_report_date(extracted_text)
+    supplied_date_text = request.form.get('report_date', '').strip()
+    supplied_report_date = None
+    if supplied_date_text:
+        try:
+            supplied_report_date = date.fromisoformat(supplied_date_text)
+        except ValueError:
+            pass
+    date_conflict = bool(ocr_report_date and supplied_report_date and ocr_report_date != supplied_report_date)
+    report_date = ocr_report_date or supplied_report_date
+    date_confirmed = bool(report_date and not date_conflict)
+    document.report_date = report_date
+
+    latest_report = _find_latest_report_for_freshness(user.id)
+    if date_conflict:
+        document.processing_status = 'VALIDATION_REQUIRED'
+        document.validation_summary = json.dumps({'report_date': 'REQUIRES_REVIEW', 'reason': 'Entered and document dates differ.'})
+        document.processed_at = datetime.now(timezone.utc)
+        document.extracted_features = json.dumps({'report_date_candidate': ocr_report_date.isoformat() if ocr_report_date else None})
+        db.session.commit()
+        return _upload_response('VALIDATION_REQUIRED', 'The entered report date does not match the date found in the document. Review is required; no patient values were changed.', document, user, patient_data)
+
+    if latest_report and report_date and latest_report.report_date and report_date < latest_report.report_date:
+        document.processing_status = 'OLD_REPORT'
+        document.is_latest = False
+        document.validation_summary = json.dumps({'freshness': 'OLD_REPORT', 'latest_report_date': latest_report.report_date.isoformat()})
+        document.processed_at = datetime.now(timezone.utc)
+        db.session.commit()
+        app.logger.info("Older report retained without feature extraction: user_id=%s document_id=%s", user.id, document.id)
+        return _upload_response('OLD_REPORT', 'Older report detected. Current dashboard data was not overwritten; the document remains in history.', document, user, patient_data,
+                                extra={'ocr_skipped': False, 'feature_extraction_skipped': True})
+
+    try:
+        app.logger.info("Medical feature extraction started: document_id=%s", document.id)
+        extracted = extract_medical_params(extracted_text)
+        feature_validation = validate_ocr_ai_features(extracted, extracted_text, report_date, date_confirmed)
+        document.extracted_features = json.dumps(extracted, ensure_ascii=False)
+        document.validation_summary = json.dumps(feature_validation, ensure_ascii=False)
+        patient_data = PatientData.query.filter_by(user_id=user.id).first()
+        auto_saved_fields = []
+        has_valid = any(item['status'] == 'VALID' for item in feature_validation.values())
+        has_review = any(item['status'] == 'REQUIRES_REVIEW' for item in feature_validation.values())
+
+        if patient_data:
+            for feature_name, patient_field in OCR_TO_PATIENT_FIELD.items():
+                check = feature_validation[feature_name]
+                value = check['value']
+                if value is None or check['status'] == 'NOT_FOUND':
+                    continue
+                old_value = getattr(patient_data, patient_field, None)
+                is_valid = check['status'] == 'VALID'
+                db.session.add(MedicalFeatureHistory(
+                    user_id=user.id, document_id=document.id, feature_name=feature_name,
+                    old_value=float(old_value) if old_value is not None else None,
+                    new_value=float(value), report_date=report_date,
+                    extraction_source='OCR', validation_status='VALID' if is_valid else 'REQUIRES_REVIEW',
+                    validation_message=check['reason'], confidence=None, user_modified=False,
+                ))
+                if is_valid and patient_field:
+                    setattr(patient_data, patient_field, value)
+                    auto_saved_fields.append(feature_name)
+
+        if date_confirmed and has_valid:
+            for previous in MedicalDocument.query.filter_by(user_id=user.id, is_latest=True).all():
+                previous.is_latest = False
+            document.is_latest = True
+        document.processing_status = ('VALIDATION_REQUIRED' if has_review or not date_confirmed
+                                      else 'VALIDATED' if has_valid else 'OCR_COMPLETED')
+        document.processed_at = datetime.now(timezone.utc)
+        db.session.commit()
+        app.logger.info("Document processing completed: document_id=%s status=%s fields=%s", document.id,
+                        document.processing_status, ','.join(auto_saved_fields) or 'none')
+        message = ('Information extracted and validated. AI dashboard values were updated from this report.' if auto_saved_fields
+                   else 'Document processed. Extracted values need review before they can update AI features.' if has_review or not date_confirmed
+                   else 'Document processed; no supported AI prediction fields were found.')
+        return _upload_response(document.processing_status, message, document, user, patient_data,
+                                extra={'ocr_skipped': False, 'auto_saved_fields': auto_saved_fields})
+    except Exception as exc:
+        db.session.rollback()
+        failed = db.session.get(MedicalDocument, document.id)
+        if failed:
+            failed.processing_status = 'FAILED'
+            failed.processed_at = datetime.now(timezone.utc)
+            failed.validation_summary = json.dumps({'error': type(exc).__name__})
+            db.session.commit()
+        app.logger.exception("Document feature validation/save failed: document_id=%s", document.id)
+        return _upload_response('FAILED', 'Document processing failed. Existing patient values were not changed.', failed, user, patient_data, 500)
 
 # My Documents page
 @app.route('/my_documents')
@@ -1709,47 +1884,24 @@ def analyze_document(doc_id):
         flash('Access denied.', 'error')
         return redirect(url_for('my_documents'))
 
-    upload_dir = app.config['UPLOAD_FOLDER']
-    file_path = os.path.join(upload_dir, document.filename)
-
-    if not os.path.exists(file_path):
-        flash('Document file not found.', 'error')
-        return redirect(url_for('my_documents'))
-
-    extracted_text = ""
-
-    try:
-        if document.file_type == 'application/pdf':
-            # Extract text from PDF
-            extracted_text = pdf_extract_text(file_path)
-        elif document.file_type.startswith('image/'):
-            # Extract text from image using OCR
-            image = Image.open(file_path)
-            extracted_text = pytesseract.image_to_string(image)
-        elif document.file_type in ['application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']:
-            # Handle DOC and DOCX files
-            try:
-                from docx import Document
-                doc = Document(file_path)
-                extracted_text = '\n'.join([paragraph.text for paragraph in doc.paragraphs])
-            except ImportError:
-                extracted_text = "DOCX processing not available. Please install python-docx library."
-            except Exception as e:
-                extracted_text = f"Error processing Word document: {str(e)}"
-        else:
-            # For other files, try to read as text
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    extracted_text = f.read()
-            except UnicodeDecodeError: 
-                extracted_text = "This file appears to be binary and cannot be analyzed as text."
-    except Exception as e:
-        flash(f'Error analyzing document: {str(e)}', 'error')
-        return redirect(url_for('my_documents'))
-
-    # Store the extracted text in the document record
-    document.extracted_text = extracted_text
-    db.session.commit()
+    extracted_text = document.extracted_text or ''
+    if not extracted_text:
+        file_path = _stored_document_path(document)
+        if not file_path or not os.path.exists(file_path):
+            flash('Document file and previously extracted text are unavailable.', 'error')
+            return redirect(url_for('my_documents'))
+        try:
+            extracted_text = _read_medical_document_text(file_path, document.file_type, document.filename)
+            document.extracted_text = extracted_text[:20000] if extracted_text else None
+            if extracted_text:
+                document.processed_at = document.processed_at or datetime.now(timezone.utc)
+                document.processing_status = document.processing_status or 'OCR_COMPLETED'
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            app.logger.exception("Document analysis failed: document_id=%s", document.id)
+            flash('Unable to analyze this document.', 'error')
+            return redirect(url_for('my_documents'))
 
     return render_template('document_analysis.html', document=document, extracted_text=extracted_text)
 
@@ -2168,56 +2320,138 @@ def ivf_simulator_api():
 # --- ML Model API Endpoints ---
 
 @app.route("/predict_ivf", methods=["POST"])
+@login_required
 def predict_ivf():
     """
     Predict IVF success using the new prediction service.
     Falls back to rule-based predictions if ML models are not available.
     """
     from prediction_service import calculate_ivf_success_prediction
-    
-    data = request.json
-    app.logger.debug(f"Received /predict_ivf request data: {data}")
-    
+    data = request.get_json(silent=True)
+    user = User.query.get(session.get('user_id'))
+    if user is None or user.user_type != 'patient':
+        return jsonify({"error": "A patient account is required for this prediction."}), 403
+    patient_data = PatientData.query.filter_by(user_id=user.id).first()
+    if patient_data is None:
+        return jsonify({"error": "Complete the patient profile before requesting a prediction."}), 400
     try:
-        # Create a simple object with the required attributes for prediction_service
-        class PatientData:
-            def __init__(self, data):
-                self.age = data.get("Age")
-                self.bmi = data.get("BMI")
-                self.amh_level = data.get("AMH")
-                self.fsh_level = data.get("FSH")
-                self.previous_ivf_cycles = data.get("Previous_IVF_Attempts")
-                self.stress = data.get("Stress_Level")
-                self.sleep_hours = data.get("Sleep_Hours")
-                self.exercise_min = data.get("Exercise_Min_per_Day")
-                # Additional fields for better predictions
-                self.partner_age = None
-                self.lifestyle_factors = None
-        
-        patient_data = PatientData(data)
-        
-        # Use the prediction service (has ML + fallback to rule-based)
-        result = calculate_ivf_success_prediction(patient_data)
-        
-        # Return in the format expected by the JavaScript
+        values = validate_prediction_payload(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc), "prediction_ready": False}), 400
+
+    try:
+        from types import SimpleNamespace
+        predictor_input = SimpleNamespace(
+            age=values['Age'], bmi=values['BMI'], amh=values['AMH'], amh_level=values['AMH'],
+            fsh=values['FSH'], fsh_level=values['FSH'],
+            previous_ivf=values['Previous_IVF_Attempts'],
+            previous_ivf_cycles=values['Previous_IVF_Attempts'],
+            stress=values['Stress_Level'], sleep_hours=values['Sleep_Hours'],
+            exercise_min=values['Exercise_Min_per_Day'],
+            partner_age=patient_data.partner_age, lifestyle_factors=patient_data.lifestyle_factors,
+        )
+        result = calculate_ivf_success_prediction(predictor_input)
+        probability = float(result.get('success_rate'))
+        if not np.isfinite(probability) or probability < 0 or probability > 100:
+            raise ValueError("Prediction service returned an invalid probability.")
+
+        source_document = None
+        try:
+            source_id = int(data.get('source_document_id')) if data.get('source_document_id') else None
+        except (TypeError, ValueError):
+            source_id = None
+        if source_id:
+            source_document = MedicalDocument.query.filter_by(id=source_id, user_id=user.id).first()
+
+        edited_fields = set(data.get('edited_fields') or [])
+        history_to_form = {
+            'age': 'Age', 'bmi': 'BMI', 'amh': 'AMH', 'fsh': 'FSH',
+            'previous_ivf': 'Previous_IVF_Attempts', 'stress': 'Stress_Level',
+            'sleep_hours': 'Sleep_Hours', 'exercise_min': 'Exercise_Min_per_Day',
+        }
+        reverse_fields = {form_key: feature for feature, form_key in history_to_form.items()}
+        latest_history = {}
+        for history in (MedicalFeatureHistory.query.filter_by(user_id=user.id)
+                        .order_by(MedicalFeatureHistory.extracted_at.desc(), MedicalFeatureHistory.id.desc()).all()):
+            if history.feature_name not in latest_history:
+                latest_history[history.feature_name] = history
+        if edited_fields:
+            wellness = WellnessLog.query.filter_by(user_id=user.id).order_by(WellnessLog.date.desc()).first()
+            old_database_values = {
+                'age': patient_data.age, 'bmi': patient_data.bmi,
+                'amh': patient_data.amh_level, 'fsh': patient_data.fsh_level,
+                'previous_ivf': patient_data.previous_ivf_cycles,
+                'stress': wellness.stress_level if wellness else None,
+                'sleep_hours': wellness.sleep_hours if wellness else None,
+                'exercise_min': wellness.exercise_minutes if wellness else None,
+            }
+            profile_fields = {
+                'Age': ('age', int), 'BMI': ('bmi', float), 'AMH': ('amh_level', float),
+                'FSH': ('fsh_level', float), 'Previous_IVF_Attempts': ('previous_ivf_cycles', int),
+            }
+            for key, (attribute, converter) in profile_fields.items():
+                if key in edited_fields:
+                    setattr(patient_data, attribute, converter(values[key]))
+            wellness_fields = ('Stress_Level', 'Sleep_Hours', 'Exercise_Min_per_Day')
+            if any(key in edited_fields for key in wellness_fields):
+                if wellness is None:
+                    wellness = WellnessLog(user_id=user.id, date=date.today())
+                    db.session.add(wellness)
+                if 'Stress_Level' in edited_fields: wellness.stress_level = int(values['Stress_Level'])
+                if 'Sleep_Hours' in edited_fields: wellness.sleep_hours = values['Sleep_Hours']
+                if 'Exercise_Min_per_Day' in edited_fields: wellness.exercise_minutes = int(values['Exercise_Min_per_Day'])
+            for key in edited_fields:
+                if key not in reverse_fields:
+                    continue
+                feature_name = reverse_fields[key]
+                previous = latest_history.get(feature_name)
+                old_value = old_database_values.get(feature_name)
+                new_value = values[key]
+                if old_value is not None and np.isclose(float(old_value), float(new_value)):
+                    continue
+                linked_doc = source_document or (previous.document if previous else None)
+                confirmed_candidate = bool(previous and previous.validation_status == 'REQUIRES_REVIEW' and previous.new_value is not None and np.isclose(previous.new_value, new_value))
+                source_kind = 'USER_CONFIRMED_OCR' if confirmed_candidate else 'USER_EDIT'
+                db.session.add(MedicalFeatureHistory(
+                    user_id=user.id, document_id=linked_doc.id if linked_doc else None,
+                    feature_name=feature_name, old_value=float(old_value) if old_value is not None else None,
+                    new_value=float(new_value), report_date=linked_doc.report_date if linked_doc else None,
+                    extraction_source=source_kind, validation_status='VALID',
+                    validation_message='User reviewed/edited the value; basic numeric validation passed.',
+                    confidence=None, user_modified=True,
+                ))
+
+        if edited_fields:
+            # Preserve explicit user review/edit even if model inference later fails.
+            db.session.commit()
+        feature_sources = _dashboard_feature_state(user, patient_data)[1]
+        prediction = Prediction(
+            user_id=user.id, success_probability=probability / 100.0,
+            protocol_recommendation='AI Ready Dashboard prediction',
+            llm_analysis=json.dumps({'prediction_label': result.get('prediction_label'),
+                                     'interpretation': result.get('interpretation', '')}),
+            model_metadata=json.dumps({
+                'source': 'ai_ready_dashboard',
+                'feature_order': list(PREDICTION_FIELD_MAP.values()),
+                'source_document_id': source_document.id if source_document else None,
+                'feature_sources': feature_sources,
+            }),
+        )
+        db.session.add(prediction)
+        db.session.commit()
         return jsonify({
             "prediction_text": result.get("prediction_label", "Unknown"),
-            "success_probability": result.get("success_rate", 35.0),
-            "confidence": result.get("confidence", 70.0),
+            "success_probability": round(probability, 1),
+            "confidence": result.get("confidence"),
             "model_type": result.get("model_type", "unknown"),
-            "interpretation": result.get("interpretation", "")
+            "interpretation": result.get("interpretation", ""),
+            "prediction_id": prediction.id,
+            "source_document": source_document.original_filename if source_document else None,
         })
-        
     except Exception as e:
-        app.logger.error(f"Prediction error: {str(e)}")
-        # Fallback to basic response if everything fails
-        return jsonify({
-            "prediction_text": "Unable to predict",
-            "success_probability": 35.0,
-            "confidence": 50.0,
-            "model_type": "error_fallback",
-            "error": str(e)
-        })
+        db.session.rollback()
+        app.logger.exception("Prediction error for user_id=%s", user.id)
+        return jsonify({"error": "Prediction could not be completed. Extracted patient data has been retained."}), 500
 
 # endpoint for generating diagrams (client-side prompt)
 @app.route("/generate_diagram", methods=["POST"])

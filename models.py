@@ -310,8 +310,41 @@ class MedicalDocument(db.Model):
     uploaded_by = db.Column(db.String(10), default='patient')  # patient, doctor
     tags = db.Column(db.String(255))  # Comma-separated tags for search
 
+    # Idempotent OCR and report-freshness metadata. All columns are nullable or
+    # have safe defaults so the existing document rows migrate without loss.
+    file_hash = db.Column(db.String(64), index=True)
+    report_date = db.Column(db.Date)
+    processing_status = db.Column(db.String(32), default='UPLOADED')
+    processed_at = db.Column(db.DateTime)
+    is_latest = db.Column(db.Boolean, default=False, nullable=False)
+    extracted_features = db.Column(db.Text)
+    validation_summary = db.Column(db.Text)
+
     def __repr__(self):
         return f'<MedicalDocument {self.filename} (v{self.version}) for User {self.user_id}>'
+
+
+class MedicalFeatureHistory(db.Model):
+    """Append-only source/audit history for OCR-populated prediction features."""
+    __tablename__ = 'medical_feature_history'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    document_id = db.Column(db.Integer, db.ForeignKey('medical_document.id'), nullable=True, index=True)
+    feature_name = db.Column(db.String(40), nullable=False, index=True)
+    old_value = db.Column(db.Float)
+    new_value = db.Column(db.Float)
+    report_date = db.Column(db.Date)
+    extraction_source = db.Column(db.String(32), nullable=False, default='OCR')
+    validation_status = db.Column(db.String(32), nullable=False)
+    validation_message = db.Column(db.Text)
+    confidence = db.Column(db.Float)  # Nullable: current OCR engine exposes no confidence score.
+    extracted_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    user_modified = db.Column(db.Boolean, nullable=False, default=False)
+
+    document = db.relationship('MedicalDocument', backref=db.backref('feature_history', lazy='dynamic'))
+
+    def __repr__(self):
+        return f'<MedicalFeatureHistory {self.feature_name} for document {self.document_id}>'
 
 
 class Prediction(db.Model):
