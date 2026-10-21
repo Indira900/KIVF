@@ -35,15 +35,15 @@ class User(db.Model):
 
     # Relationships (one-to-many/one-to-one)
     patient_data = db.relationship('PatientData', backref='owner', uselist=False, cascade="all, delete-orphan")
-    ivf_cycles = db.relationship('IVFCycle', backref='patient', lazy='dynamic', cascade="all, delete-orphan")
-    medication_reminders = db.relationship('MedicationReminder', backref='user', lazy='dynamic', cascade="all, delete-orphan")
-    wellness_logs = db.relationship('WellnessLog', backref='user', lazy='dynamic', cascade="all, delete-orphan")
-    predictions = db.relationship('Prediction', backref='user', lazy='dynamic', cascade="all, delete-orphan")
-    chat_messages = db.relationship('ChatMessage', backref='user', lazy='dynamic', cascade="all, delete-orphan")
-    medical_documents = db.relationship('MedicalDocument', backref='user', lazy='dynamic', cascade="all, delete-orphan")
-    partner_connections_as_patient = db.relationship('PartnerConnection', foreign_keys='PartnerConnection.patient_id', backref='patient_user', lazy='dynamic', cascade="all, delete-orphan")
-    partner_connections_as_partner = db.relationship('PartnerConnection', foreign_keys='PartnerConnection.partner_id', backref='partner_user', lazy='dynamic', cascade="all, delete-orphan")
-    partner_invitations = db.relationship('PartnerInvitation', backref='patient', lazy='dynamic', cascade="all, delete-orphan")
+    ivf_cycles = db.relationship('IVFCycle', backref='patient', cascade="all, delete-orphan")
+    medication_reminders = db.relationship('MedicationReminder', backref='user', cascade="all, delete-orphan")
+    wellness_logs = db.relationship('WellnessLog', backref='user', cascade="all, delete-orphan")
+    predictions = db.relationship('Prediction', backref='user', cascade="all, delete-orphan")
+    chat_messages = db.relationship('ChatMessage', backref='user', cascade="all, delete-orphan")
+    medical_documents = db.relationship('MedicalDocument', backref='user', cascade="all, delete-orphan")
+    partner_connections_as_patient = db.relationship('PartnerConnection', foreign_keys='PartnerConnection.patient_id', backref='patient_user', cascade="all, delete-orphan")
+    partner_connections_as_partner = db.relationship('PartnerConnection', foreign_keys='PartnerConnection.partner_id', backref='partner_user', cascade="all, delete-orphan")
+    partner_invitations = db.relationship('PartnerInvitation', backref='patient', cascade="all, delete-orphan")
     
     def set_password(self, password):
         """Hashes the password for secure storage."""
@@ -108,18 +108,19 @@ class PatientData(db.Model):
 
     def calculate_bmi(self):
         """Calculates BMI (Body Mass Index) from height and weight."""
-        if self.height and self.weight:
-            # BMI = weight (kg) / (height (m))^2
+        if self.height is not None and self.weight is not None:
             height_m = self.height / 100
             if height_m > 0:
                 self.bmi = self.weight / (height_m ** 2)
-            else:
-                 self.bmi = None
-        else:
+                return
+        if self.bmi is None:
             self.bmi = None
 
     # Override __init__ to automatically calculate BMI when data is set
     def __init__(self, **kwargs):
+        if 'bmi' in kwargs and 'height' not in kwargs and 'weight' not in kwargs:
+            super().__init__(**kwargs)
+            return
         super().__init__(**kwargs)
         self.calculate_bmi()
 
@@ -227,6 +228,7 @@ class WellnessLog(db.Model):
     
     # Qualitative Data
     symptoms = db.Column(db.Text) # Free text about physical symptoms
+    notes = db.Column(db.Text)
     mood_notes = db.Column(db.Text)
     stress_factors = db.Column(db.Text)
     sleep_notes = db.Column(db.Text)

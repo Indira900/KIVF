@@ -60,4 +60,8 @@ final_ivf_model_comparison.png
 .DS_Store
 Thumbs.db
 npm-debug.log*
-yarn-debug.log*
+yarn-debug.log*# Local audit backups and debug artifacts
+.local/
+instance/
+pytest_debug.txt
+pytest_route_check.txt

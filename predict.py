@@ -4,6 +4,7 @@ import joblib
 import json
 import numpy as np
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from main import app  # Use the existing app instance
 from models import db, PatientData, WellnessLog, Prediction, User
@@ -12,12 +13,24 @@ MODEL_DIR = "models"
 MODEL_FILE = os.path.join(MODEL_DIR, "ivf_success_model.pkl")
 META_FILE = os.path.join(MODEL_DIR, "ivf_model_metadata.json")
 
+@lru_cache(maxsize=1)
 def load_model_and_meta():
     if not os.path.exists(MODEL_FILE) or not os.path.exists(META_FILE):
         raise FileNotFoundError("Model or metadata files not found. Run train_model.py first.")
     model = joblib.load(MODEL_FILE)
-    meta = json.load(open(META_FILE, "r"))
+    with open(META_FILE, "r", encoding="utf-8") as metadata_file:
+        meta = json.load(metadata_file)
     return model, meta
+
+
+def _predict_with_probability(model, feature_vector):
+    if not hasattr(model, "predict_proba"):
+        return int(model.predict(feature_vector)[0]), None
+
+    probabilities = model.predict_proba(feature_vector)[0]
+    classes = getattr(model, "classes_", None)
+    prediction = classes[int(np.argmax(probabilities))] if classes is not None else model.predict(feature_vector)[0]
+    return int(prediction), probabilities
 
 def build_feature_vector(user_id, meta):
     """
@@ -26,7 +39,7 @@ def build_feature_vector(user_id, meta):
     """
     with app.app_context():
         pat = PatientData.query.filter_by(user_id=user_id).first()
-        if not pat:
+        if pat is None:
             raise ValueError(f"No PatientData found for user_id={user_id}. Please complete your medical profile.")
         # latest wellness log
         wl = WellnessLog.query.filter_by(user_id=user_id).order_by(WellnessLog.date.desc()).first()
@@ -40,26 +53,29 @@ def build_feature_vector(user_id, meta):
                 bmi_val = pat.weight / (height_m ** 2)
         
         mapping = {
-            "age": getattr(pat, "age", None) or 30,
-            "bmi": bmi_val or 22.5, # Default BMI
-            "amh": getattr(pat, "amh_level", None) or 2.5,
-            "fsh": getattr(pat, "fsh_level", None) or 6.0,
-            "previous_ivf": getattr(pat, "previous_ivf_cycles", 0) or 0,
+            "age": getattr(pat, "age", None),
+            "bmi": bmi_val,
+            "amh": getattr(pat, "amh_level", None),
+            "fsh": getattr(pat, "fsh_level", None),
+            "previous_ivf": getattr(pat, "previous_ivf_cycles", None),
             "stress": wl.stress_level if wl and wl.stress_level is not None else 3,
             "sleep_hours": wl.sleep_hours if wl and wl.sleep_hours is not None else 7.0,
             "exercise_min": wl.exercise_minutes if wl and wl.exercise_minutes is not None else 30
         }
+        defaults = {"age": 30, "bmi": 22.5, "amh": 2.5, "fsh": 6.0, "previous_ivf": 0}
+        mapping = {feature: defaults.get(feature) if value is None else value
+                   for feature, value in mapping.items()}
 
         feat_order = meta["feature_order"]
         # Ensure all values are float for the model
         fv = np.array([[float(mapping.get(f, 0)) for f in feat_order]]) # Use .get with default 0 for safety
-        return fv, mapping
+        return fv
 
 def predict_and_store(user_id):
     model, meta = load_model_and_meta()
-    fv, mapping = build_feature_vector(user_id, meta)
-    proba = model.predict_proba(fv)[0] if hasattr(model, "predict_proba") else None
-    pred = int(model.predict(fv)[0])
+    fv = build_feature_vector(user_id, meta)
+    mapping = {feature: float(value) for feature, value in zip(meta["feature_order"], fv[0])}
+    pred, proba = _predict_with_probability(model, fv)
 
     # store in Prediction table
     with app.app_context():
@@ -84,21 +100,16 @@ def predict_from_features(features_dict, meta):
     model, _ = load_model_and_meta()  # meta is already loaded, but we need model
 
     # Map features_dict to the expected keys, with defaults
-    mapping = {
-        "age": features_dict.get("age", 30),
-        "bmi": features_dict.get("bmi", 22.5),
-        "amh": features_dict.get("amh", 2.5),
-        "fsh": features_dict.get("fsh", 6.0),
-        "previous_ivf": features_dict.get("previous_ivf", 0),
-        "stress": features_dict.get("stress", 3),
-        "sleep_hours": features_dict.get("sleep_hours", 7.0),
-        "exercise_min": features_dict.get("exercise_min", 30)
+    defaults = {
+        "age": 30, "bmi": 22.5, "amh": 2.5, "fsh": 6.0,
+        "previous_ivf": 0, "stress": 3, "sleep_hours": 7.0, "exercise_min": 30
     }
+    mapping = {feature: defaults[feature] if features_dict.get(feature) is None
+               else features_dict[feature] for feature in defaults}
 
     feat_order = meta["feature_order"]
     fv = np.array([[float(mapping.get(f, 0)) for f in feat_order]])
-    proba = model.predict_proba(fv)[0] if hasattr(model, "predict_proba") else None
-    pred = int(model.predict(fv)[0])
+    pred, proba = _predict_with_probability(model, fv)
 
     probability = float(proba[1]) if proba is not None else float(pred)
     prediction_text = "Success Likely" if probability >= 0.5 else "Success Unlikely"

@@ -79,7 +79,7 @@
         <!-- Incomplete Profile Warning -->
         <div class="row">
             <div class="col-12">
-                <div class="alert alert-warning text-center">
+                <div class="alert alert-warning text-center persistent-alert">
                     <i class="fas fa-exclamation-triangle fa-2x mb-3"></i>
                     <h4>Complete Your Profile for Accurate Predictions</h4>
                     <p>To provide personalized AI predictions, we need your medical information.</p>
@@ -488,7 +488,7 @@
 {% block scripts %}
 {{ super() }}
 <script>
-document.getElementById('prediction-form').addEventListener('submit', async function(event) {
+document.getElementById('prediction-form')?.addEventListener('submit', async function(event) {
     event.preventDefault();
 
     const predictBtn = document.getElementById('predict-btn');
@@ -584,7 +584,7 @@ document.getElementById('prediction-form').addEventListener('submit', async func
 
 // diagram form logic
 const diagramForm = document.getElementById('diagram-form');
-diagramForm.addEventListener('submit', async function(evt) {
+diagramForm?.addEventListener('submit', async function(evt) {
     evt.preventDefault();
     const promptEl = document.getElementById('diagram-prompt');
     const resultEl = document.getElementById('diagram-result');
@@ -618,6 +618,10 @@ diagramForm.addEventListener('submit', async function(evt) {
  */
 (async function initSimulator() {
     'use strict';
+
+    const predictionForm = document.getElementById('prediction-form');
+    const resultContainer = document.getElementById('result-container');
+    if (!predictionForm || !resultContainer) return;
 
     // Track chart instance globally so we can destroy/recreate it
     let improvementChartInstance = null;
@@ -944,7 +948,7 @@ diagramForm.addEventListener('submit', async function(evt) {
     }
 
     // Hook into the existing prediction form submit
-    const originalSubmitHandler = document.getElementById('prediction-form').onsubmit;
+    const originalSubmitHandler = predictionForm.onsubmit;
     
     // We need to hook into the existing listener without replacing it
     // Since the form already has a listener via addEventListener, we'll piggyback
@@ -967,7 +971,6 @@ diagramForm.addEventListener('submit', async function(evt) {
     });
 
     // Start observing the result container for prediction results
-    const resultContainer = document.getElementById('result-container');
     resultObserver.observe(resultContainer, { childList: true, subtree: true });
 
     console.log('IVF Success Improvement Simulator initialized. Waiting for prediction...');

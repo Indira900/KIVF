@@ -284,7 +284,7 @@ function initializeUtilities() {
     });
     
     // Auto-hide alerts after 5 seconds
-    const alerts = document.querySelectorAll('.alert');
+    const alerts = document.querySelectorAll('.alert:not(.persistent-alert)');
     alerts.forEach(alert => {
         setTimeout(() => {
             if (alert.parentNode) {

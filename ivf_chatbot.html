@@ -192,10 +192,6 @@
 
     <script>
         // API Configuration
-        const CHAT_MODEL = 'gemini-2.5-flash-preview-05-20';
-        const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
-        const apiKey = 'AIzaSyANUUVQwPH9Ydl-xAx4ARRLopI4rNu50lo'; // **PASTE YOUR API KEY HERE**
-
         const chatBox = document.getElementById('chat-box');
         const userInput = document.getElementById('user-input');
         const loadingSpinner = document.getElementById('loading-spinner');
@@ -279,24 +275,17 @@
                     }
                 };
 
-                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent?key=${apiKey}`, {
+                const response = await fetch('/api/chat', {
                     method: 'POST',
+                    credentials: 'same-origin',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify({ message: userText })
                 });
-                console.log('API response status:', response.status);
                 const result = await response.json();
-                console.log('API response JSON:', result);
-
-                if (result.candidates && result.candidates.length > 0) {
-                    const botResponse = result.candidates[0].content.parts[0].text;
-                    addMessageToChat(botResponse, 'bot');
-                } else {
-                    addMessageToChat("I'm sorry, I couldn't get a response. Please try again.", 'bot');
-                }
+                if (!response.ok) throw new Error(result.error || 'Chat request failed.');
+                addMessageToChat(result.response, 'bot');
             } catch (error) {
-                console.error('Error generating content:', error);
-                addMessageToChat("An error occurred while fetching the response. Please try again.", 'bot');
+                addMessageToChat(error.message || 'An error occurred while fetching the response. Please try again.', 'bot');
             } finally {
                 loadingSpinner.classList.add('hidden');
                 chatBox.scrollTop = chatBox.scrollHeight;
@@ -344,44 +333,32 @@
                 audioSource = null;
             }
 
-            const payload = {
-                contents: [{ parts: [{ text: text }] }],
-                generationConfig: {
-                    responseModalities: ["AUDIO"],
-                    speechConfig: {
-                        voiceConfig: {
-                            prebuiltVoiceConfig: { voiceName: "Iapetus" }
-                        }
-                    }
-                }
-            };
-
             try {
-                const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent?key=${apiKey}`, {
+                const response = await fetch('/api/chat/tts', {
                     method: 'POST',
+                    credentials: 'same-origin',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify({ text })
                 });
                 const result = await response.json();
-                const part = result?.candidates?.[0]?.content?.parts?.[0];
-                const audioData = part?.inlineData?.data;
-                const mimeType = part?.inlineData?.mimeType;
+                if (!response.ok) throw new Error(result.error || 'Speech request failed.');
+                const audioData = result.audio_data;
+                const mimeType = result.mime_type;
 
                 if (audioData && mimeType && mimeType.startsWith("audio/")) {
-                    const sampleRate = parseInt(mimeType.match(/rate=(\d+)/)[1], 10);
+                    const sampleRateMatch = mimeType.match(/rate=(\d+)/);
+                    const sampleRate = sampleRateMatch ? parseInt(sampleRateMatch[1], 10) : 24000;
                     const pcmData = base64ToArrayBuffer(audioData);
                     const pcm16 = new Int16Array(pcmData);
                     const wavBlob = pcmToWav(pcm16, sampleRate);
                     const audioUrl = URL.createObjectURL(wavBlob);
-                    
-                    // Use the WAV blob to create an Audio object and play it
                     const audio = new Audio(audioUrl);
                     audio.play();
                 } else {
-                    console.error("No audio data received from the API.");
+                    throw new Error('No audio data received from the service.');
                 }
             } catch (error) {
-                console.error("Error with TTS API:", error);
+                addMessageToChat(error.message || 'Speech playback is unavailable.', 'bot');
             }
         }
     </script>

@@ -18,7 +18,7 @@ class TestPerformance:
             "accuracy": 0.75
         }
 
-    def test_prediction_response_time(self, sample_meta, benchmark):
+    def test_prediction_response_time(self, sample_meta):
         """Test prediction response time under normal load"""
         features_dict = {
             "age": 30,
@@ -31,14 +31,16 @@ class TestPerformance:
             "exercise_min": 30
         }
 
-        # Benchmark the prediction function
-        result = benchmark(predict_from_features, features_dict, sample_meta)
+        predict_from_features(features_dict, sample_meta)
+        start_time = time.perf_counter()
+        results = [predict_from_features(features_dict, sample_meta) for _ in range(10)]
+        average_time = (time.perf_counter() - start_time) / len(results)
 
-        assert result is not None
-        assert "prediction" in result
+        assert results
+        assert "prediction" in results[0]
 
         # Assert reasonable response time (< 100ms)
-        assert benchmark.stats["mean"] < 0.1
+        assert average_time < 0.1
 
     def test_concurrent_predictions(self, sample_meta):
         """Test multiple concurrent predictions"""

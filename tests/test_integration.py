@@ -16,22 +16,22 @@ class TestIntegration:
             'last_name': 'Test',
             'password': 'password123',
             'confirm_password': 'password123',
-            'user_type': 'patient'
+            'user_type': 'patient',
+            'agree_terms': 'on'
         }, follow_redirects=True)
 
         assert response.status_code == 200
 
         # Login user
         response = client.post('/login', data={
-            'username': 'integration_test',
+            'email': 'integration@test.com',
             'password': 'password123'
         }, follow_redirects=True)
 
         assert response.status_code == 200
         assert b'Welcome' in response.data or b'Dashboard' in response.data
 
-    @patch('routes.predict_and_store')
-    def test_prediction_workflow(self, mock_predict, client, db_session):
+    def test_prediction_workflow(self, client, db_session):
         """Test complete prediction workflow"""
         # Create and login user
         from models import User
@@ -48,53 +48,21 @@ class TestIntegration:
 
         # Login
         response = client.post('/login', data={
-            'username': 'predict_test',
+            'email': 'predict@test.com',
             'password': 'password123'
         }, follow_redirects=True)
-
-        # Mock prediction function
-        mock_predict.return_value = {
-            'prediction': 1,
-            'probability': 0.75,
-            'prediction_id': 1
-        }
 
         # Access prediction page
         response = client.get('/predict', follow_redirects=True)
         assert response.status_code == 200
 
-    def test_ivf_predictor_form_submission(self, client):
-        """Test IVF predictor form submission"""
-        # Test form rendering
+    def test_ivf_predictor_requires_login(self, client):
         response = client.get('/ivf_predictor')
-        assert response.status_code == 200
-        assert b'IVF Success Predictor' in response.data
+        assert response.status_code == 302
+        assert '/login' in response.headers['Location']
 
-        # Test form submission with sample data
-        response = client.post('/ivf_predictor', data={
-            'age': '30',
-            'bmi': '22.5',
-            'amh': '2.5',
-            'fsh': '6.0',
-            'previous_ivf': '0',
-            'stress': '3',
-            'sleep_hours': '7.0',
-            'exercise_min': '30'
-        }, follow_redirects=True)
-
-        assert response.status_code == 200
-
-    @patch('routes.Clinic')
-    def test_clinic_search_workflow(self, mock_clinic, client):
+    def test_clinic_search_workflow(self, client):
         """Test clinic search functionality"""
-        # Mock clinic data
-        mock_clinic_obj = MagicMock()
-        mock_clinic_obj.id = 1
-        mock_clinic_obj.name = 'Test Clinic'
-        mock_clinic_obj.city = 'Mumbai'
-        mock_clinic_obj.success_rate = 65.0
-        mock_clinic.query.all.return_value = [mock_clinic_obj]
-
         # Test clinic search page
         response = client.get('/find_clinic')
         assert response.status_code == 200
@@ -114,6 +82,27 @@ class TestIntegration:
         assert response.status_code == 200
         assert b'IVF Assistant' in response.data
 
+    def test_chat_api_fallback_and_input_validation(self, client, db_session, monkeypatch):
+        import openai_service
+        from models import ChatMessage, User
+
+        user = User(username='chat_api_test', email='chat-api@test.com', first_name='Chat',
+                    last_name='Test', user_type='patient')
+        user.set_password('password123')
+        db_session.add(user)
+        db_session.commit()
+        monkeypatch.setattr(openai_service, 'GOOGLE_API_KEY', '')
+        with client.session_transaction() as flask_session:
+            flask_session['user_id'] = user.id
+            flask_session['user_type'] = user.user_type
+
+        response = client.post('/api/chat', json={'message': 'What is the IVF process?'})
+        assert response.status_code == 200
+        assert 'fertility specialist' in response.get_json()['response']
+        assert ChatMessage.query.filter_by(user_id=user.id).count() == 1
+        assert client.post('/api/chat', json={'message': '  '}).status_code == 400
+        assert client.post('/api/chat', json={'message': 'x' * 4001}).status_code == 400
+
     def test_document_upload_flow(self, client, db_session):
         """Test document upload functionality"""
         # Create and login user
@@ -131,7 +120,7 @@ class TestIntegration:
 
         # Login
         client.post('/login', data={
-            'username': 'doc_test',
+            'email': 'doc@test.com',
             'password': 'password123'
         }, follow_redirects=True)
 
@@ -157,14 +146,14 @@ class TestIntegration:
 
         # Login
         client.post('/login', data={
-            'username': 'wellness_test',
+            'email': 'wellness@test.com',
             'password': 'password123'
         }, follow_redirects=True)
 
         # Test wellness page
         response = client.get('/wellness')
         assert response.status_code == 200
-        assert b'Wellness Tracker' in response.data
+        assert b'Wellness &amp; Mood Tracking' in response.data or b'Wellness & Mood Tracking' in response.data
 
         # Test wellness log submission
         response = client.post('/wellness', data={
@@ -176,6 +165,48 @@ class TestIntegration:
         }, follow_redirects=True)
 
         assert response.status_code == 200
+        from models import WellnessLog
+        saved_log = WellnessLog.query.filter_by(user_id=user.id).one()
+        assert saved_log.mood_rating == 4
+        assert saved_log.stress_level == 3
+
+    def test_treatment_cycle_and_medication_reminder_persist_for_owner(self, client, db_session):
+        from models import IVFCycle, MedicationReminder, User
+
+        patient = User(username='treatment_owner', email='treatment-owner@test.com',
+                       first_name='Treatment', last_name='Owner', user_type='patient')
+        patient.set_password('password123')
+        other = User(username='treatment_other', email='treatment-other@test.com',
+                     first_name='Other', last_name='Patient', user_type='patient')
+        other.set_password('password123')
+        db_session.add_all([patient, other])
+        db_session.commit()
+
+        with client.session_transaction() as flask_session:
+            flask_session['user_id'] = patient.id
+            flask_session['user_type'] = 'patient'
+        response = client.post('/my_treatment', data={
+            'protocol': 'Antagonist', 'start_date': '2026-10-17', 'patient_notes': 'Integration check'
+        }, follow_redirects=True)
+        assert response.status_code == 200
+        cycle = IVFCycle.query.filter_by(patient_id=patient.id).one()
+        assert cycle.protocol == 'Antagonist' and cycle.status == 'stimulation'
+
+        response = client.post('/my_reminders', data={
+            'medication_name': 'Test medication', 'dosage': '1 dose', 'frequency': 'Daily',
+            'time_of_day': '08:30', 'start_date': '2026-10-17'
+        }, follow_redirects=True)
+        assert response.status_code == 200
+        reminder = MedicationReminder.query.filter_by(user_id=patient.id).one()
+        assert reminder.medication_name == 'Test medication' and reminder.is_active is True
+
+        with client.session_transaction() as flask_session:
+            flask_session['user_id'] = other.id
+            flask_session['user_type'] = 'patient'
+        response = client.post(f'/toggle_reminder/{reminder.id}', follow_redirects=True)
+        assert response.status_code == 200
+        db_session.refresh(reminder)
+        assert reminder.is_active is True
 
     def test_faq_accessibility(self, client):
         """Test FAQ page accessibility"""

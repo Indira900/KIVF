@@ -104,17 +104,10 @@ class TestPredictionService:
             assert features[0][6] == 6.5  # sleep_hours
             assert features[0][7] == 45  # exercise_min
 
-    @patch('predict.app')
-    def test_build_feature_vector_no_patient_data(self, mock_app, sample_meta):
-        """Test feature vector building when no patient data exists"""
-        mock_app.app_context.return_value.__enter__ = MagicMock()
-        mock_app.app_context.return_value.__exit__ = MagicMock()
-
-        with patch('predict.PatientData') as mock_patient_model:
-            mock_patient_model.query.filter_by.return_value.first.return_value = None
-
-            with pytest.raises(ValueError, match="No PatientData found"):
-                build_feature_vector(999, sample_meta)
+    def test_build_feature_vector_no_patient_data(self, sample_meta, app, db_session):
+        """Raise a clear error when the database has no row for this user."""
+        with pytest.raises(ValueError, match="No PatientData found"):
+            build_feature_vector(999999999, sample_meta)
 
     def test_predict_from_features_edge_cases(self, sample_meta):
         """Test prediction with edge case values"""

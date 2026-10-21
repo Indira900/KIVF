@@ -235,11 +235,36 @@ def create_notification(user_id, message, type='info', category='system', link=N
         return None
 
 # Utility functions
+def table_exists(table_name):
+    try:
+        inspector = db.inspect(db.engine)
+        return table_name in inspector.get_table_names()
+    except Exception:
+        return False
+
+
+def get_session_user():
+    user_id = session.get('user_id')
+    if user_id is None:
+        return None
+
+    try:
+        if not table_exists('user'):
+            session.clear()
+            return None
+        return User.query.get(user_id)
+    except Exception:
+        session.clear()
+        return None
+
+
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if 'user_id' not in session:
+        user = get_session_user()
+        if user is None:
             flash('Please log in to access this page.', 'error')
+            session.clear()
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return wrapper
@@ -493,8 +518,8 @@ def generate_medical_insights(params):
 # Authentication routes
 @app.route('/')
 def index():
-    if 'user_id' in session:
-        user = User.query.get(session['user_id'])
+    user = get_session_user()
+    if user is not None:
         if user.user_type == 'admin':
             return redirect(url_for('admin_dashboard'))
         elif user.user_type == 'doctor':
@@ -510,10 +535,10 @@ def login():
     login_type = request.args.get('type', 'general')  # Get type from query param, default to 'general'
 
     if request.method == 'POST':
-        email = request.form['email']
+        email = request.form.get('email', '').strip()
         password = request.form['password']
+        user = User.query.filter_by(email=email).first() if email else None
 
-        user = User.query.filter_by(email=email).first()
         if user and user.check_password(password):
             session['user_id'] = user.id
             session['user_type'] = user.user_type
@@ -534,6 +559,12 @@ def login():
             flash('Invalid email or password.', 'error')
 
     return render_template('login.html', login_type=login_type)
+
+
+@app.route('/predict', methods=['GET'])
+@login_required
+def predict():
+    return redirect(url_for('ivf_predictor'))
 
 @app.route("/reset_password", methods=['GET', 'POST'])
 def reset_request():
@@ -1011,83 +1042,108 @@ def my_cycle_notes():
     return render_template('view_notes.html', user=user, notes=notes)
 
 # Find a Clinic/Doctor page
-@app.route('/find_clinic', methods=['GET'])
-@login_required
+@app.route('/find_clinic', methods=['GET', 'POST'])
 def find_clinic():
-    # Get query parameters
-    query = request.args.get('query', '').strip()
-    state_filter = request.args.get('state', '').strip()
-    clinic_type_filter = request.args.get('clinic_type', '').strip()
-    page = request.args.get('page', 1, type=int)
+    # Support both direct query-string filters and form submissions from the page
+    request_data = request.form if request.method == 'POST' else request.args
+    query = (request_data.get('query') or request_data.get('city') or '').strip()
+    state_filter = (request_data.get('state') or '').strip()
+    clinic_type_filter = (request_data.get('clinic_type') or '').strip()
+    page = request.args.get('page', 1, type=int) if request.method == 'GET' else 1
     per_page = 20  # Clinics per page
 
-    # Base query
-    base_query = Clinic.query
+    if not table_exists('clinic'):
+        return render_template('find_clinic.html',
+                              clinics=[],
+                              clinics_data=[],
+                              query=query,
+                              state_filter=state_filter,
+                              clinic_type_filter=clinic_type_filter,
+                              clinics_pagination=None,
+                              states=[],
+                              clinic_types=[],
+                              total_clinics=0)
 
-    # Apply filters
-    if query:
-        # Improved search: fuzzy matching on name, city, state, zip_code
-        search_conditions = []
-        search_terms = query.split()
-        for term in search_terms:
-            term_lower = term.lower()
-            search_conditions.append(db.func.lower(Clinic.name).like(f"%{term_lower}%"))
-            search_conditions.append(db.func.lower(Clinic.city).like(f"%{term_lower}%"))
-            search_conditions.append(db.func.lower(Clinic.state).like(f"%{term_lower}%"))
-            if Clinic.zip_code is not None:
-                search_conditions.append(db.func.lower(Clinic.zip_code).like(f"%{term_lower}%"))
-        base_query = base_query.filter(db.or_(*search_conditions))
+    try:
+        # Base query
+        base_query = Clinic.query
 
-    if state_filter:
-        base_query = base_query.filter(db.func.lower(Clinic.state) == state_filter.lower())
+        # Apply filters
+        if query:
+            # Improved search: fuzzy matching on name, city, state, zip_code
+            search_conditions = []
+            search_terms = query.split()
+            for term in search_terms:
+                term_lower = term.lower()
+                search_conditions.append(db.func.lower(Clinic.name).like(f"%{term_lower}%"))
+                search_conditions.append(db.func.lower(Clinic.city).like(f"%{term_lower}%"))
+                search_conditions.append(db.func.lower(Clinic.state).like(f"%{term_lower}%"))
+                if Clinic.zip_code is not None:
+                    search_conditions.append(db.func.lower(Clinic.zip_code).like(f"%{term_lower}%"))
+            base_query = base_query.filter(db.or_(*search_conditions))
 
-    if clinic_type_filter:
-        base_query = base_query.filter(db.func.lower(Clinic.clinic_type) == clinic_type_filter.lower())
+        if state_filter:
+            base_query = base_query.filter(db.func.lower(Clinic.state) == state_filter.lower())
 
-    # Order by state, city, name
-    base_query = base_query.order_by(Clinic.state, Clinic.city, Clinic.name)
+        if clinic_type_filter:
+            base_query = base_query.filter(db.func.lower(Clinic.clinic_type) == clinic_type_filter.lower())
 
-    # Paginate
-    clinics_pagination = base_query.paginate(page=page, per_page=per_page, error_out=False)
-    clinics = clinics_pagination.items
+        # Order by state, city, name
+        base_query = base_query.order_by(Clinic.state, Clinic.city, Clinic.name)
 
-    # Get filter options
-    all_states = db.session.query(Clinic.state).distinct().order_by(Clinic.state).all()
-    states = [state[0] for state in all_states]
+        # Paginate
+        clinics_pagination = base_query.paginate(page=page, per_page=per_page, error_out=False)
+        clinics = clinics_pagination.items
 
-    all_clinic_types = db.session.query(Clinic.clinic_type).distinct().filter(Clinic.clinic_type.isnot(None)).order_by(Clinic.clinic_type).all()
-    clinic_types = [ct[0] for ct in all_clinic_types]
+        # Get filter options
+        all_states = db.session.query(Clinic.state).distinct().order_by(Clinic.state).all()
+        states = [state[0] for state in all_states]
 
-    total_clinics = base_query.count()
+        all_clinic_types = db.session.query(Clinic.clinic_type).distinct().filter(Clinic.clinic_type.isnot(None)).order_by(Clinic.clinic_type).all()
+        clinic_types = [ct[0] for ct in all_clinic_types]
 
-    # Convert clinics to dictionaries for JSON serialization
-    clinics_data = []
-    for clinic in clinics:
-        clinics_data.append({
-            'id': clinic.id,
-            'name': clinic.name,
-            'address': clinic.address,
-            'city': clinic.city,
-            'state': clinic.state,
-            'zip_code': clinic.zip_code,
-            'phone': clinic.phone,
-            'website': clinic.website,
-            'latitude': clinic.latitude,
-            'longitude': clinic.longitude,
-            'description': clinic.description,
-            'clinic_type': clinic.clinic_type
-        })
+        total_clinics = base_query.count()
 
-    return render_template('find_clinic.html',
-                          clinics=clinics,
-                          clinics_data=clinics_data,
-                          query=query,
-                          state_filter=state_filter,
-                          clinic_type_filter=clinic_type_filter,
-                          clinics_pagination=clinics_pagination,
-                          states=states,
-                          clinic_types=clinic_types,
-                          total_clinics=total_clinics)
+        # Convert clinics to dictionaries for JSON serialization
+        clinics_data = []
+        for clinic in clinics:
+            clinics_data.append({
+                'id': clinic.id,
+                'name': clinic.name,
+                'address': clinic.address,
+                'city': clinic.city,
+                'state': clinic.state,
+                'zip_code': clinic.zip_code,
+                'phone': clinic.phone,
+                'website': clinic.website,
+                'latitude': clinic.latitude,
+                'longitude': clinic.longitude,
+                'description': clinic.description,
+                'clinic_type': clinic.clinic_type
+            })
+
+        return render_template('find_clinic.html',
+                              clinics=clinics,
+                              clinics_data=clinics_data,
+                              query=query,
+                              state_filter=state_filter,
+                              clinic_type_filter=clinic_type_filter,
+                              clinics_pagination=clinics_pagination,
+                              states=states,
+                              clinic_types=clinic_types,
+                              total_clinics=total_clinics)
+    except Exception as exc:
+        app.logger.warning(f"Clinic search unavailable: {exc}")
+        return render_template('find_clinic.html',
+                              clinics=[],
+                              clinics_data=[],
+                              query=query,
+                              state_filter=state_filter,
+                              clinic_type_filter=clinic_type_filter,
+                              clinics_pagination=None,
+                              states=[],
+                              clinic_types=[],
+                              total_clinics=0)
 
 # Clinic Detail page
 @app.route('/clinic/<int:clinic_id>')
@@ -1273,10 +1329,10 @@ def delete_user(user_id):
 @app.route('/ivf_predictor')
 @login_required
 def ivf_predictor():
-    user = User.query.get(session['user_id'])
+    user = get_session_user()
     patient_data = PatientData.query.filter_by(user_id=user.id).first()
 
-    if not patient_data:
+    if patient_data is None:
         flash('Please complete your medical profile first.', 'error')
         return redirect(url_for('update_profile'))
 
@@ -1332,17 +1388,19 @@ def ivf_predictor():
 
 # Wellness tracking
 @app.route('/wellness', methods=['GET', 'POST'])
-@login_required
 def wellness():
-    user = User.query.get(session['user_id'])
-
-    # Add a check to handle invalid sessions (e.g., after a database reset)
-    if user is None:
-        session.clear() # Clear the invalid session
-        flash('Your session has expired. Please log in again.', 'error')
-        return redirect(url_for('login'))
+    user = get_session_user()
 
     if request.method == 'POST':
+        if user is None:
+            flash('Please log in to save your wellness log.', 'error')
+            return redirect(url_for('login'))
+
+        # Add a check to handle invalid sessions (e.g., after a database reset)
+        if user is None:
+            session.clear() # Clear the invalid session
+            flash('Your session has expired. Please log in again.', 'error')
+            return redirect(url_for('login'))
         # Safely parse date from form
         date_str = request.form.get('date')
         log_date = datetime.strptime(date_str, '%Y-%m-%d').date() if date_str else datetime.utcnow().date()
@@ -1421,7 +1479,10 @@ def wellness():
         return redirect(url_for('wellness'))
 
     # Get recent logs for charts
-    recent_logs = WellnessLog.query.filter_by(user_id=user.id).order_by(WellnessLog.date.desc()).limit(30).all()
+    if user is not None:
+        recent_logs = WellnessLog.query.filter_by(user_id=user.id).order_by(WellnessLog.date.desc()).limit(30).all()
+    else:
+        recent_logs = []
 
     return render_template('wellness.html', user=user, recent_logs=recent_logs)
 
@@ -1846,15 +1907,11 @@ def upload_document():
 
 # My Documents page
 @app.route('/my_documents')
-@login_required
 def my_documents():
-    user = User.query.get(session['user_id'])
+    user = User.query.get(session.get('user_id')) if 'user_id' in session else None
 
-    # Add a check to handle invalid sessions (e.g., after a database reset)
     if user is None:
-        session.clear() # Clear the invalid session
-        flash('Your session has expired. Please log in again.', 'error')
-        return redirect(url_for('login'))
+        return render_template('my_documents.html', user=None, documents=[])
 
     if user.user_type != 'patient':
         flash('Access denied.', 'error')
@@ -2089,11 +2146,13 @@ def view_conversation(patient_id):
 @login_required
 def chat_api():
     try:
-        data = request.get_json()
-        message = data.get('message')
-        
-        if not message:
-            return jsonify({'error': 'No message provided'}), 400
+        data = request.get_json(silent=True)
+        message = data.get('message') if isinstance(data, dict) else None
+        if not isinstance(message, str) or not message.strip():
+            return jsonify({'error': 'A non-empty message is required.'}), 400
+        message = message.strip()
+        if len(message) > 4000:
+            return jsonify({'error': 'Message must be 4000 characters or fewer.'}), 400
         
         user = User.query.get(session['user_id']) # type: ignore
         patient_data = None
@@ -2102,6 +2161,8 @@ def chat_api():
         
         # Get AI response using Gemini
         response = get_chatbot_response_gemini(message, user, patient_data)
+        response = (str(response).strip() +
+                "\n\nResearch/demo information only, not a diagnosis or treatment plan. Confirm medical decisions with your fertility specialist.")
         
         # Save chat to database
         chat_message = ChatMessage(
@@ -2127,11 +2188,13 @@ def chat_api():
 @login_required
 def tts_api():
     try:
-        data = request.get_json()
-        text = data.get('text')
-        
-        if not text:
-            return jsonify({'error': 'No text provided'}), 400
+        data = request.get_json(silent=True)
+        text = data.get('text') if isinstance(data, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            return jsonify({'error': 'Non-empty text is required.'}), 400
+        text = text.strip()
+        if len(text) > 4000:
+            return jsonify({'error': 'Text must be 4000 characters or fewer.'}), 400
         
         # Generate TTS audio using Gemini
         audio_result = generate_tts_audio(text)
@@ -2150,9 +2213,8 @@ def tts_api():
 
 # Chatbot page
 @app.route('/chatbot')
-@login_required
 def chatbot():
-    user = User.query.get(session['user_id'])
+    user = get_session_user()
     return render_template('chatbot.html', user=user)
 
 # FAQ page
@@ -2440,7 +2502,7 @@ def predict_ivf():
         db.session.add(prediction)
         db.session.commit()
         return jsonify({
-            "prediction_text": result.get("prediction_label", "Unknown"),
+            "prediction_text": result.get("prediction_label") or result.get("interpretation", "Estimate unavailable"),
             "success_probability": round(probability, 1),
             "confidence": result.get("confidence"),
             "model_type": result.get("model_type", "unknown"),

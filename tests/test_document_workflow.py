@@ -2,7 +2,9 @@
 
 import io
 import json
+import tempfile
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -76,6 +78,29 @@ def test_exact_duplicate_skips_extraction_and_does_not_create_a_second_document(
     assert second.get_json()["status"] == "DUPLICATE"
     assert second.get_json()["ocr_skipped"] is True
     assert MedicalDocument.query.count() == 1
+
+
+def test_document_download_is_restricted_to_owner(patient_client, app, db_session):
+    from models import MedicalDocument, User
+
+    client, _, _ = patient_client
+    with tempfile.TemporaryDirectory(prefix="document-owner-test-", dir=app.instance_path) as upload_dir:
+        app.config["UPLOAD_FOLDER"] = upload_dir
+        result = upload(client, report_text()).get_json()
+        document = db_session.get(MedicalDocument, result["document_id"])
+        other_user = User(username="other_document_user", email="other-document@example.test",
+                          first_name="Other", last_name="User", user_type="patient")
+        other_user.set_password("test-password")
+        db_session.add(other_user)
+        db_session.commit()
+        (Path(upload_dir) / document.filename).write_bytes(b"private report")
+
+        with client.session_transaction() as session:
+            session["user_id"] = other_user.id
+            session["user_type"] = "patient"
+        response = client.get(f"/download_document/{document.id}")
+        assert response.status_code == 302
+        assert response.headers["Location"].endswith("/my_documents")
 
 
 def test_older_report_is_kept_without_feature_extraction_or_overwrite(patient_client, app, db_session, tmp_path, monkeypatch):

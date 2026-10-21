@@ -10,7 +10,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "fallback-key")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY != "fallback-key" else None
 
 # Google Gemini API Configuration
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "'AIzaSyDTyVkuQySv4S6bLEK2n11rgvGffofTMW4'")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GEMINI_CHAT_MODEL = "gemini-2.0-flash"
 GEMINI_TTS_MODEL = "gemini-2.0-flash-lite"
 
